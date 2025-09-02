@@ -1,0 +1,16 @@
+# Node.js 依赖
+node_modules/
+
+# 环境配置
+.env
+
+# Playwright 用户数据目录（保存登录态）
+.userdata/
+
+# 日志文件
+*.log
+
+# 系统/编辑器缓存
+.DS_Store
+Thumbs.db
+.vscode/
