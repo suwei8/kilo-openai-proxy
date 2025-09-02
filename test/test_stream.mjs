@@ -6,7 +6,8 @@ const endpoint = 'http://127.0.0.1:8033/v1/chat/completions';
 const payload = {
   model: 'gemini-webui',
   messages: [
-    { role: 'user', content: '请写一段春天的诗' }
+    { role: 'user', content: '写一首夏天的诗' }
+      // { role: 'user', content: '写一首春天的诗' }
   ],
   stream: true
 };

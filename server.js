@@ -94,7 +94,7 @@ async function ensureBrowser() {
 }
 
 
-// 输入 + 回车（首选），若没触发回答，再尝试按钮（轻微增强：提交后等待“新消息气泡出现”）
+// 输入 + 回车（首选），若没触发回答，再尝试按钮（轻微增强：提交后等待“新消息气泡出现”）（最后一定会返回 beforeCount；未开始则抛错）
 async function submitPrompt(prompt) {
   // 1) 找输入框
   let sel = null;
@@ -103,7 +103,7 @@ async function submitPrompt(prompt) {
   }
   if (!sel) throw new Error('未找到输入框');
 
-  // 记录提交前的消息气泡数量，用来确认是否真的开始生成
+  // 本次提交前的消息气泡数量（作为 baseline）
   const beforeCount = await page.$$eval('div[id^="model-response-message-content"]', n => n.length).catch(()=>0);
 
   const loc = page.locator(sel);
@@ -121,68 +121,74 @@ async function submitPrompt(prompt) {
     }, sel, prompt);
   });
 
-  // 2) 先回车
+  // 2) 回车提交（连按两次更稳）
+  await loc.press('Enter').catch(()=>{});
+  await page.waitForTimeout(120);
   await loc.press('Enter').catch(()=>{});
 
-  // 等待“气泡数量增加”或“文本变化”，两者任一即可视为开始
-  const started = await page.waitForFunction((count) => {
+  // 3) 判定是否开始（气泡数变多 或 最后一条有字）
+  const started1 = await page.waitForFunction((count) => {
     const roots = document.querySelectorAll('div[id^="model-response-message-content"]');
-    const lastText = roots.length ? (roots[roots.length-1].innerText || roots[roots.length-1].textContent || '').trim() : '';
-    // 数量增了 或 最后一条已有非空文本
-    return (roots.length > count) || (lastText && lastText.length > 0);
+    const last = roots.length ? roots[roots.length-1] : null;
+    const t = last ? (last.innerText || last.textContent || '').trim() : '';
+    return (roots.length > count) || (t.length > 0);
   }, { timeout: 2000 }, beforeCount).then(() => true).catch(() => false);
 
-  if (started) return;
+  if (started1) return beforeCount;
 
-  // 仅回车模式则到此为止
-  if (String(process.env.FORCE_ENTER_ONLY).toLowerCase() === 'true') return;
+  // 4) 兜底点击按钮（若未禁用）
+  if (String(process.env.FORCE_ENTER_ONLY).toLowerCase() !== 'true') {
+    const clicked = await page.evaluate(() => {
+      const tryClick = (sel) => {
+        const btn = document.querySelector(sel);
+        if (!btn) return false;
+        const dis = btn.getAttribute('disabled') || btn.getAttribute('aria-disabled');
+        if (dis && String(dis).toLowerCase() !== 'false') return false;
+        btn.click();
+        return true;
+      };
+      return tryClick('button[aria-label="Send message"]')
+          || tryClick('button[aria-label*="Send"]:not([aria-label*="Temporary"])');
+    });
 
-  // 3) 再兜底点击“发送”按钮（排除临时聊天）
-  await page.evaluate((primary, safe, block) => {
-    const temp = document.querySelector(block);
-    if (temp) temp.setAttribute('data-kilo-block', 'true');
-    const tryClick = (sel) => {
-      const btn = document.querySelector(sel);
-      if (!btn) return false;
-      const label = (btn.getAttribute('aria-label') || btn.title || '').toLowerCase();
-      if (label.includes('temporary')) return false;
-      btn.click();
-      return true;
-    };
-    return tryClick(primary) || tryClick(safe);
-  }, 'button[aria-label="Send message"]', 'button[aria-label*="Send"]:not([aria-label*="Temporary"])', 'button[aria-label="Temporary chat"]');
+    if (clicked) {
+      const started2 = await page.waitForFunction((count) => {
+        const roots = document.querySelectorAll('div[id^="model-response-message-content"]');
+        const last = roots.length ? roots[roots.length-1] : null;
+        const t = last ? (last.innerText || last.textContent || '').trim() : '';
+        return (roots.length > count) || (t.length > 0);
+      }, { timeout: 2000 }, beforeCount).then(() => true).catch(() => false);
+
+      if (started2) return beforeCount;
+    }
+  }
+
+  // 5) 到这里仍未开始，抛错（避免读到上次的文本）
+  throw new Error('submit_not_started');
 }
 
 
-// ===== 抓取回答文本（优先：消息气泡；退化：aria-live）=====
-async function grabAnswerText() {
-  return await page.evaluate(() => {
-    // 1) 优先读取“消息气泡”——这才是最终渲染的答案
+// ===== 抓取回答文本（优先：消息气泡；退化：aria-live）只读取“本次的新气泡”=====
+// 说明：为了彻底避免复读，当没有新气泡时我们返回空串，不再回退到 aria-live。只有当确认新气泡出现了才读取文本。
+async function grabAnswerText(baselineCount = 0) {
+  return await page.evaluate((base) => {
     const roots = Array.from(document.querySelectorAll('div[id^="model-response-message-content"]'));
-    if (roots.length) {
-      const last = roots[roots.length - 1];
-      // 尝试把最后一条滚进可视区，避免虚拟列表未渲染
-      try { last.scrollIntoView({ block: 'nearest' }); } catch {}
-      // 优先 markdown，再退回到 root 的可见文本
-      const md = last.querySelector('.markdown');
-      const text = (md?.innerText || md?.textContent || last.innerText || last.textContent || '').trim();
+    // 只关注 baseline 之后的新气泡
+    const target = roots.length > base ? roots[roots.length - 1] : null;
+    if (target) {
+      try { target.scrollIntoView({ block: 'nearest' }); } catch {}
+      const md = target.querySelector('.markdown');
+      const text = (md?.innerText || md?.textContent || target.innerText || target.textContent || '').trim();
       if (text) return text;
     }
-
-    // 2) 退化到 aria-live（注意：这块容易混入“正在输入/提示”）
-    const lives = document.querySelectorAll('[aria-live="polite"], [aria-live="assertive"]');
-    if (lives && lives.length) {
-      const el = lives[lives.length - 1];
-      return (el.innerText || el.textContent || '').trim();
-    }
-
+    // 如果没有新气泡，返回空串；不要退回到 aria-live，否则会读到旧文案
     return '';
-  }).catch(() => '');
+  }, baselineCount).catch(() => '');
 }
 
 
 // ===== 流式增量读取 =====
-async function* readAnswerInChunks() {
+async function* readAnswerInChunks(baselineCount = 0) {
   let last = '';
   let lastChangeAt = Date.now();
   const t0 = Date.now();
@@ -190,7 +196,7 @@ async function* readAnswerInChunks() {
   const stableMs = Number(STABLE_MS);
 
   while (Date.now() - t0 < maxMs) {
-    const raw = await grabAnswerText();
+    const raw = await grabAnswerText(baselineCount);      // ← 传 baseline
     if (!raw) { await new Promise(r => setTimeout(r, 80)); continue; }
     const cur = raw.replace(/\b(Gemini is typing|Gemini replied|正在输入.*?)\b/gi, '').trim();
     if (cur && !isPlaceholderText(cur) && cur !== last) {
@@ -205,44 +211,43 @@ async function* readAnswerInChunks() {
     await new Promise(r => setTimeout(r, 80));
   }
 
-  const final = await grabAnswerText();
+  const final = await grabAnswerText(baselineCount);      // ← 传 baseline
   const finalClean = (final || '').replace(/\b(Gemini is typing|Gemini replied|正在输入.*?)\b/gi, '').trim();
   if (finalClean && finalClean.length > last.length) {
     yield finalClean.slice(last.length);
   }
 }
 
+
+
 // 非流式：更稳的等待逻辑（结束条件更稳）
-async function waitForFinalAnswer() {
+async function waitForFinalAnswer(baselineCount = 0) {
   let last = '';
   let lastChangeAt = Date.now();
   const maxMs = Number(MAX_ANSWER_MS);
   const stableMs = Number(STABLE_MS);
   const t0 = Date.now();
+  let everHadText = false;
 
   while (Date.now() - t0 < maxMs) {
     let raw = '';
-    try { raw = await grabAnswerText(); } catch {}
+    try { raw = await grabAnswerText(baselineCount); } catch {}  // ← 传 baseline
     const clean = (raw || '')
       .replace(/\b(Gemini is typing|Gemini replied|正在输入|思考中|生成中|加载中)\b/gi, '')
       .trim();
 
     if (clean && clean !== last) {
-      last = clean;
-      lastChangeAt = Date.now();
-      // 超短回答（OK/Hi/Yes）直接返回
-      if (last.length <= 5) return last;
+      last = clean; everHadText = true; lastChangeAt = Date.now();
+      if (last.length <= 5) return last; // 超短答直接返回
     }
-
-    // 有文本且在稳定窗口内未变化 => 完成
     if (last && Date.now() - lastChangeAt >= stableMs) return last;
-
     await new Promise(r => setTimeout(r, 80));
   }
 
-  // 超时：返回已有文本，避免挂死
+  if (!everHadText) throw new Error('no_text_captured');
   return last;
 }
+
 
 
 
@@ -335,16 +340,16 @@ app.post('/v1/chat/completions', async (req, res) => {
   res.once('finish', () => { clearTimeout(watchdog); busy = false; });
 
   try {
-    const prompt = toPrompt(req.body);
-    if (!prompt) return res.status(400).json({ error: { message: 'empty prompt' } });
+  const prompt = toPrompt(req.body);
+  if (!prompt) return res.status(400).json({ error: { message: 'empty prompt' } });
 
-    await ensureBrowser();
-    await submitPrompt(prompt);
+  await ensureBrowser();
+  const baseline = await submitPrompt(prompt);      // ← 拿到提交前的气泡数
 
   if (stream) {
     sseHead(res);
     let full = '';
-    for await (const delta of readAnswerInChunks()) {
+    for await (const delta of readAnswerInChunks(baseline)) {  // ← 传 baseline
       full += delta;
       res.write(sseChunk(id, delta));
     }
@@ -352,8 +357,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.end();
     return;
   } else {
-    const full = await waitForFinalAnswer();          // 永不抛错
-    const safe = typeof full === 'string' ? full : ''; // 防御
+    const full = await waitForFinalAnswer(baseline);           // ← 传 baseline
+    const safe = typeof full === 'string' ? full : '';
     res.json({
       id,
       object: 'chat.completion',
@@ -364,6 +369,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
     return;
   }
+
+
 } catch (e) {
   const msg = String(e?.message || e);
   console.error('[proxy error]', msg);
