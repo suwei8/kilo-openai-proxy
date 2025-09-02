@@ -1,6 +1,6 @@
 # kilo-openai-proxy · 极简设计文档
 
-## 目标：**本地个人使用、极简、高性能、Node 实现、WebUI 方式驱动 Gemini、OpenAI 兼容接口、清洗 KiloCode 请求头与请求体、稳定流式返回**
+## 目标：** WebUI驱动Gemini以OpenAI 兼容接口代理为本地个人使用的API服务 、 极简、高性能、Node 实现,支持清洗 KiloCode 请求头与请求体、稳定流式返回的API代理服务器*
 
 ##  默认适配 Windows/PowerShell 开发环境。
 
