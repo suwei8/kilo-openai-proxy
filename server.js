@@ -51,6 +51,8 @@ const ANSWER_LIVE = '[aria-live="polite"], [aria-live="assertive"]';
 const BUSY_BUTTON = 'button[aria-label*="Stop"],button[aria-label*="停止"],button[aria-label*="停止生成"]';
 const AFTER_INPUT_SETTLE_MS = Number(process.env.AFTER_INPUT_SETTLE_MS ?? 1000); // 默认 1s
 
+// 允许通过 .env 控制是否只用“回车提交”，彻底禁用点击按钮兜底
+const FORCE_ENTER_ONLY = String(process.env.FORCE_ENTER_ONLY ?? 'false').toLowerCase() === 'true';
 // ===== 回复区气泡：统一选择器 =====
 const BUBBLE_ROOT_SELECTORS = [
   'div[id^="model-response-message-content"]',
@@ -461,13 +463,19 @@ async function submitPrompt(prompt) {
   await page.waitForTimeout(AFTER_INPUT_SETTLE_MS);
   
 
-  await waitSendReady(5000);
+  if (FORCE_ENTER_ONLY) {
+    // 仅靠回车提交，不等待按钮状态
+    await focusIntoEditable(sel);
+    try { await page.keyboard.press('Enter'); } catch {}
+  } else {
+    await waitSendReady(5000);
 
-  // 先回车一次（有的皮肤支持）
-  try { await page.keyboard.press('Enter'); } catch {}
+    // 先回车一次（有的皮肤支持）
+    try { await page.keyboard.press('Enter'); } catch {}
 
-  // 再点击按钮
-  try { await clickSendButton(); } catch {}
+    // 再点击按钮
+    try { await clickSendButton(); } catch {}
+  }
 
   const started = await page.waitForFunction((count) => {
     const roots = document.querySelectorAll('div[id^="model-response-message-content"]');
@@ -478,8 +486,14 @@ async function submitPrompt(prompt) {
 
   if (started) return beforeCount;
 
-  // 兜底再点一次
-  try { await clickSendButton(); } catch {}
+  if (FORCE_ENTER_ONLY) {
+    // 回车再试一次
+    await focusIntoEditable(sel);
+    try { await page.keyboard.press('Enter'); } catch {}
+  } else {
+    // 兜底再点一次
+    try { await clickSendButton(); } catch {}
+  }
   const started2 = await page.waitForFunction((count) => {
     const roots = document.querySelectorAll('div[id^="model-response-message-content"]');
     const last  = roots.length ? roots[roots.length-1] : null;
