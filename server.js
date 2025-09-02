@@ -9,8 +9,15 @@
 import 'dotenv/config';
 import express from 'express';
 import { chromium } from 'playwright';
+import { sanitizeKiloRequest } from './tools/kilo_sanitizer.mjs';
 
 // ========= 配置集中解析（含默认值） =========
+const flag = (v, def = false) => {
+  if (v == null) return def;
+  const s = String(v).trim().toLowerCase();
+  return ['1','true','on','yes','y'].includes(s);
+};
+
 const CFG = {
   PORT: parseInt(process.env.PORT || '8033', 10),
   HEADLESS: String(process.env.HEADLESS || 'false').toLowerCase() === 'true',
@@ -20,8 +27,22 @@ const CFG = {
   MAX_ANSWER_MS: parseInt(process.env.MAX_ANSWER_MS || '60000', 10),
   STABLE_MS: parseInt(process.env.STABLE_MS || '1200', 10),
   AFTER_INPUT_SETTLE_MS: parseInt(process.env.AFTER_INPUT_SETTLE_MS || '800', 10),
-  FORCE_ENTER_ONLY: String(process.env.FORCE_ENTER_ONLY || 'false').toLowerCase() === 'true'
+  FORCE_ENTER_ONLY: String(process.env.FORCE_ENTER_ONLY || 'false').toLowerCase() === 'true',
+
+  // ====== Sanitizer 相关（可在 .env 调整）======
+  SAN_ON: flag(process.env.KILO_SANITIZE_ON, true),              // 总开关：默认启用
+  SAN_MODE: process.env.KILO_SANITIZE_MODE || 'tools-minimal',   // tools-minimal | tools-off | passthrough
+  SAN_KEEP: (process.env.KILO_KEEP_TAGS || '')                   // 白名单工具追加
+              .split(',').map(s => s.trim()).filter(Boolean),
+  SAN_STRIP_ENV: flag(process.env.KILO_STRIP_ENV, true),         // 去 <environment_details>
+  SAN_STRIP_STREAM: flag(process.env.KILO_STRIP_STREAM_OPTIONS, true), // 去 stream_options
+  SAN_STRIP_MODEL: flag(process.env.KILO_STRIP_MODEL, true),     // 顶层 model 固定移除（你要求的默认）
+  SAN_BLOCK_MODELS: (process.env.KILO_BLOCK_MODELS || 'gemini-2.5-flash,gemini-webui')
+              .split(',').map(s => s.trim()).filter(Boolean),
+  SAN_PRUNE_TOP: flag(process.env.KILO_PRUNE_TOP_FIELDS, false), // 仅保留常见顶层字段（安全模式）
+  SAN_LANG: process.env.KILO_LANG || 'zh',                       // 极简 system 提示语言
 };
+
 
 // ========= App 状态 =========
 const app = express();
@@ -570,6 +591,55 @@ const sseDone = (id, full) =>
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
   })}\n\ndata: [DONE]\n\n`;
 
+
+  // ========= Sanitizer 适配 =========
+function buildSanitizeOptionsFromCFG() {
+  return {
+    mode: CFG.SAN_MODE,                 // tools-minimal | tools-off | passthrough
+    keep: CFG.SAN_KEEP,                 // 追加白名单
+    stripEnv: CFG.SAN_STRIP_ENV,
+    stripStreamOptions: CFG.SAN_STRIP_STREAM,
+    stripUnknownTopFields: CFG.SAN_PRUNE_TOP,
+    stripModel: CFG.SAN_STRIP_MODEL,    // 固定移除 model（你已经要求默认 true）
+    blockModels: CFG.SAN_BLOCK_MODELS,
+    lang: CFG.SAN_LANG,
+  };
+}
+
+// 封装一个“条件精简”辅助 & 两个诊断端点
+/** 仅当识别为 Kilo Code 请求时才做精简；否则原样返回 */
+function maybeSanitizeKiloBody(inBody) {
+  if (!CFG.SAN_ON) return { body: inBody, changed: false, report: { on:false } };
+  const opts = buildSanitizeOptionsFromCFG();
+  const { json, changed, reason, bytesBefore, bytesAfter } =
+    sanitizeKiloRequest(inBody, opts);
+  return {
+    body: json,
+    changed,
+    report: { on:true, reason, bytesBefore, bytesAfter, saved: Math.max(0, bytesBefore - bytesAfter) }
+  };
+}
+
+// ====== 诊断端点：查看 Sanitizer 配置 ======
+app.get('/sanitize-config', (_req, res) => {
+  res.json({
+    on: CFG.SAN_ON,
+    options: buildSanitizeOptionsFromCFG()
+  });
+});
+
+// ====== 诊断端点：试跑一次精简（不真正调用网页）======
+app.post('/sanitize-dryrun', (req, res) => {
+  try {
+    const { body, changed, report } = maybeSanitizeKiloBody(req.body);
+    res.json({ ok: true, changed, report, out: body });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
+
 // ========= 路由 =========
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 app.get('/status', (_, res) =>
@@ -685,7 +755,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (busy) return res.status(429).json({ error: { message: 'busy: single-flight in progress' } });
   busy = true;
 
-  const stream = wantStream(req.body);
   const id = 'chatcmpl_' + Date.now().toString(36);
   const watchdog = setTimeout(() => {
     busy = false;
@@ -700,7 +769,19 @@ app.post('/v1/chat/completions', async (req, res) => {
   });
 
   try {
-    const prompt = toPrompt(req.body);
+    // ① 进入 Sanitizer（仅 Kilo Code 命中时才改写）
+    const { body: sanitizedBody, changed, report } = maybeSanitizeKiloBody(req.body);
+    if (changed) {
+      // 方便你观察节省量与原因
+      res.setHeader('X-KiloSanitize', '1');
+      res.setHeader('X-KiloSanitize-Reason', String(report?.reason || ''));
+      } else {
+        res.setHeader('X-KiloSanitize', '0');
+    }
+    const stream = wantStream(sanitizedBody);
+    // ② 用“精简后的”消息体来组装 prompt
+    const prompt = toPrompt(sanitizedBody);
+
     if (!prompt) return res.status(400).json({ error: { message: 'empty prompt' } });
 
     await ensureBrowser();
