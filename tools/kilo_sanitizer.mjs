@@ -108,6 +108,32 @@ const DEFAULTS = {
   pretty: true,
 };
 
+const PROMPT_TEXTS = {
+  zh: {
+    header: `根据<task>中的任务描述选择使用XML标签将完成任务的完整代码包裹，并且确保代码都保持正确的缩进。
+`,
+    allowPrefix: '允许使用的工具（白名单）：\n- ',
+    noTools: '本轮会话不允许调用任何工具。',
+    osBlock: ``,
+    tail: '回答我的问题后等待我返回执行结果再继续下一步。',
+  },
+  en: {
+    header: `You are a software engineering assistant. Always respond in English.
+Use XML-like tool tags when needed (at most one tool call per message).
+Format:
+<tool_name>
+ <代码...>
+</tool_name>`,
+    allowPrefix: 'Allowed tools:\n- ',
+    noTools: 'No tool calls are allowed in this session.',
+    osBlock: `Windows & Encoding:
+- Use PowerShell and force UTF-8 for <execute_command> on Windows:
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); <YOUR_CMD>"
+- Prefer Remove-Item for deletion; avoid Linux rm.`,
+    tail: 'Note: Call tools only when necessary; after each call, wait for the user to return the result before proceeding.',
+  },
+};
+
 /** 判定是否为 Kilo Code 请求 */
 export function isKiloRequest(payload) {
   try {
@@ -151,34 +177,18 @@ function shouldBlockModel(value, list) {
 
 /** 构造极简 system 提示（中文/英文） */
 function buildMinimalSystemPrompt({ lang = 'zh', keepTools = [], modeSlug = 'code' }) {
-  const cn = lang !== 'en';
-  const header = cn
-    ? '你是中文软件工程助手；始终用简体中文回答。\n你可以在需要时使用 XML 风格的工具标签（每条消息最多一次工具调用）。\n工具调用格式：\n<tool_name>\n  <param1>value</param1>\n  <param2>value</param2>\n</tool_name>'
-    : 'You are a software engineering assistant. Always respond in English.\nUse XML-like tool tags when needed (at most one tool call per message).\nFormat:\n<tool_name>\n  <param1>value</param1>\n  <param2>value</param2>\n</tool_name>';
+  const t = PROMPT_TEXTS[lang] || PROMPT_TEXTS.zh;
 
   const allow = keepTools.length
-    ? (cn ? '允许使用的工具（白名单）：\n- ' : 'Allowed tools: \n- ') + keepTools.map(t => `<${t}>…</${t}>`).join('\n- ')
-    : (cn ? '本轮会话不允许调用任何工具。' : 'No tool calls are allowed in this session.');
-  
-    const osBlock = cn ? [
-    'Windows 兼容与编码：',
-    '- 在 Windows 上调用 <execute_command> 时，务必使用 PowerShell，并将控制台输出强制为 UTF-8：',
-    '  powershell -NoProfile -ExecutionPolicy Bypass -Command "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); <YOUR_CMD>"',
-    '- 删除文件/目录请使用：Remove-Item -LiteralPath <路径> -Force （目录需加 -Recurse），不要用 rm。',
-    '- 常见命令替换：ls→dir / Get-ChildItem，cat→type / Get-Content，mv→move / Move-Item，cp→copy / Copy-Item。',
-    '- 写入文本请用：Set-Content / Add-Content -Encoding UTF8（无 BOM）。'
-  ].join('\\n') : [
-    'Windows & Encoding:',
-    '- Use PowerShell and force UTF-8 for <execute_command> on Windows:',
-    '  powershell -NoProfile -ExecutionPolicy Bypass -Command "$OutputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); <YOUR_CMD>"',
-    '- Prefer Remove-Item for deletion; avoid Linux rm.',
-  ].join('\\n');
-  
-  const tail = cn
-    ? '注意：只有在确有必要时才调用工具；每次工具调用后等待用户返回执行结果再继续下一步。'
-    : 'Note: Call tools only when necessary; after each call, wait for the user to return the result before proceeding.';
+    ? t.allowPrefix + keepTools.map(tl => `<${tl}>...</${tl}>`).join('\n- ')
+    : t.noTools;
 
-  return [header, allow, osBlock, tail].join('\n');
+  return [
+    `${t.header}\n\n当前模式：${modeSlug}`,
+    allow,
+    t.osBlock,
+    t.tail
+  ].join('\n\n');
 }
 
 /**
