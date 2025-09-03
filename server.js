@@ -110,7 +110,11 @@ const extractTextFromMessage = (m) => {
 
 const toPrompt = (body) => {
   const msgs = Array.isArray(body?.messages) ? body.messages : [];
-  return msgs.map(extractTextFromMessage).filter(Boolean).join('\n\n---\n\n').trim();
+  return msgs
+    .map((m) => String(extractTextFromMessage(m) || ''))
+    .filter(Boolean)
+    .join('\n\n---\n\n')
+    .trim();
 };
 
 const wantStream = (body) => (typeof body?.stream === 'boolean' ? body.stream : true);
@@ -846,6 +850,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 // ========= 启动 =========
 await ensureBrowser();
 console.log('[kilo-openai-proxy] browser ready');
-app.listen(CFG.PORT, () =>
-  console.log(`[kilo-openai-proxy] listening on http://127.0.0.1:${CFG.PORT}`)
+app.listen(CFG.PORT, '0.0.0.0', () =>
+  console.log(`[kilo-openai-proxy] listening on http://0.0.0.0:${CFG.PORT}`)
 );
+
