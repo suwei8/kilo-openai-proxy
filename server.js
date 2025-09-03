@@ -573,23 +573,30 @@ const sseHead = (res) => {
     'X-Accel-Buffering': 'no'
   });
 };
+
+// 中途增量帧
 const sseChunk = (id, delta) =>
   `data: ${JSON.stringify({
     id,
     object: 'chat.completion.chunk',
     created: nowSec(),
     model: 'gemini-webui',
-    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+    choices: [
+      { index: 0, delta: { content: delta }, finish_reason: null }
+    ]
   })}\n\n`;
-const sseDone = (id, full) =>
+
+// 收尾帧（finish_reason = stop）
+const sseStop = (id) =>
   `data: ${JSON.stringify({
     id,
-    object: 'chat.completion',
+    object: 'chat.completion.chunk',
     created: nowSec(),
     model: 'gemini-webui',
-    choices: [{ index: 0, message: { role: 'assistant', content: full }, finish_reason: 'stop' }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  })}\n\ndata: [DONE]\n\n`;
+    choices: [
+      { index: 0, delta: {}, finish_reason: 'stop' }
+    ]
+  })}\n\n`;
 
 
   // ========= Sanitizer 适配 =========
@@ -772,14 +779,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     // ① 进入 Sanitizer（仅 Kilo Code 命中时才改写）
     const { body: sanitizedBody, changed, report } = maybeSanitizeKiloBody(req.body);
     if (changed) {
-      // 方便你观察节省量与原因
       res.setHeader('X-KiloSanitize', '1');
       res.setHeader('X-KiloSanitize-Reason', String(report?.reason || ''));
-      } else {
-        res.setHeader('X-KiloSanitize', '0');
+    } else {
+      res.setHeader('X-KiloSanitize', '0');
     }
+
     const stream = wantStream(sanitizedBody);
-    // ② 用“精简后的”消息体来组装 prompt
     const prompt = toPrompt(sanitizedBody);
 
     if (!prompt) return res.status(400).json({ error: { message: 'empty prompt' } });
@@ -788,16 +794,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     const baseline = await submitPrompt(prompt);
 
     if (stream) {
+      // ========= 流式返回 =========
       sseHead(res);
       let full = '';
+
       for await (const delta of readAnswerInChunks(baseline)) {
         full += delta;
         res.write(sseChunk(id, delta));
       }
-      res.write(sseDone(id, full));
+
+      // ✅ 正确收尾
+      res.write(sseStop(id));         // 发出 finish_reason=stop 的收尾 chunk
+      res.write('data: [DONE]\n\n');  // 发标准 [DONE] 结束帧
       res.end();
       return;
     } else {
+      // ========= 非流式返回 =========
       const full = await waitForFinalAnswer(baseline);
       const safe = typeof full === 'string' ? full : '';
       res.json({
@@ -805,7 +817,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         object: 'chat.completion',
         created: nowSec(),
         model: 'gemini-webui',
-        choices: [{ index: 0, message: { role: 'assistant', content: safe }, finish_reason: 'stop' }],
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: safe },
+            finish_reason: 'stop'
+          }
+        ],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
       });
       return;
@@ -823,6 +841,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   }
 });
+
 
 // ========= 启动 =========
 await ensureBrowser();
